@@ -8,8 +8,8 @@
 #define BLKS_PER_LUN 32*8
 #define BLKS_PER_CH 32*8*4
 #define BLKS_PER_ZONE 32
-#define ERASE_THRESHOLD 256 * 100
-static void zns_zone_blks_remaping(FemuCtrl *n, NvmeZone *zone);
+#define ERASE_THRESHOLD 32 * 5
+static void zns_zone_blks_remaping(FemuCtrl *n, NvmeZone *zone,uint32_t zone_id);
 
 static inline uint32_t zns_zone_idx(NvmeNamespace *ns, uint64_t slba)
 {
@@ -429,12 +429,13 @@ static uint16_t zns_auto_open_zone(NvmeNamespace *ns, NvmeZone *zone)
     uint16_t status = NVME_SUCCESS;
     FemuCtrl *n = ns->ctrl;
     uint8_t zs = zns_get_zone_state(zone);
+    uint32_t zone_idx = zns_zone_idx(ns, zone->d.zslba);
 
     if (zs == NVME_ZONE_STATE_EMPTY) {
         zns_auto_transition_zone(ns);
         status = zns_aor_check(ns, 1, 1);
         //Check whether the zone needs to be remapped
-        zns_zone_blks_remaping(n,zone);
+        zns_zone_blks_remaping(n,zone,zone_idx);
     } else if (zs == NVME_ZONE_STATE_CLOSED) {
         zns_auto_transition_zone(ns);
         status = zns_aor_check(ns, 0, 1);
@@ -670,7 +671,7 @@ static void zns_aio_zone_reset_cb(NvmeRequest *req, NvmeZone *zone)
             // uint32_t reset_block_id = (ch*128)*8 + (lun*32)*8 + reset_zone_block_id;
             zone_blk_offset = ch  + lun * num_ch ;
             zone->blks[zone_blk_offset]->erase_count += 1;
-            zone->erase_count += zone->blks[zone_blk_offset]->erase_count;
+            zone->erase_count += 1;
             zns->ch[ch].fc[lun].erase_count += 1;
             femu_debug("reset_block_id:%lu,erase_count:%lu\n\r",zone->blks[zone_blk_offset]->blk_id,zone->blks[zone_blk_offset]->erase_count);
             struct nand_cmd erase;
@@ -679,6 +680,7 @@ static void zns_aio_zone_reset_cb(NvmeRequest *req, NvmeZone *zone)
             zns_advance_status(n, &erase, &ppa);
         }
     }
+    femu_debug("Zone%u:reset_count:%lu\n\r",reset_zone_block_id,zone->erase_count);
 }
 
 typedef uint16_t (*op_handler_t)(NvmeNamespace *, NvmeZone *, NvmeZoneState,
@@ -1397,7 +1399,6 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     if (status) {
         goto err;
     }
-
     //将请求的写指针赋值给res-slba，然后更新zone的写指针zone->w_ptr += nlb;
     res->slba = zns_advance_zone_wp(ns, zone, nlb);
 
@@ -1525,6 +1526,8 @@ static void zns_init_zone_blks_map(FemuCtrl *n)
         {
             // struct zns_blk **zone_blk = zones[i].blks + sizeof(struct zns_blk)
             zones[i].blks[j] = &(ssd->ch[wpp->ch].fc[wpp->lun].blk[zone_idx]);
+            //初始化blk存储池
+            ssd->zns_blk_pool.blks_pool[zones[i].blks[j]->blk_id] = 1;
             advance_read_pointer(n);
         }
     }
@@ -1533,18 +1536,22 @@ static void zns_init_zone_blks_map(FemuCtrl *n)
 
 //Check whether the zone needs to be remapped. If the zone wear is too large( >= ERASE_THRESHOLD), 
 //complete the remapping
-static void zns_zone_blks_remaping(FemuCtrl *n, NvmeZone *zone)
+static void zns_zone_blks_remaping(FemuCtrl *n, NvmeZone *zone ,uint32_t zone_id)
 {
     NvmeZone *zones = n->zone_array;
     struct zns_ssd *ssd = n->zns;
     // zone = &n->zone_array[zone_idx];
+
+    // return (n->zone_size_log2 > 0 ? slba >> n->zone_size_log2 : slba / n->zone_size);
+
     struct zns_blk *min_erase_blk = NULL;//最小擦除次数 blk的物理blk id
 
     if(zone->erase_count >= ERASE_THRESHOLD || zone->blks[0] == NULL)
     {
         for (int i = 0; i < n->num_zones; i++, zones++) 
         {
-            if (zones->d.zs  != NVME_ZONE_STATE_EMPTY)
+            uint8_t zs = zns_get_zone_state(zones);
+            if (zs  != NVME_ZONE_STATE_EMPTY)
             {
                 continue;
             }
@@ -1554,9 +1561,11 @@ static void zns_zone_blks_remaping(FemuCtrl *n, NvmeZone *zone)
                 ssd->zns_blk_pool.blks_pool[zones->blks[j]->blk_id] = 0;
                 zones->blks[j] = NULL;
             }
+            zones->erase_count = 0;
         }
         //remaping 
         //步骤：1.从每个lun中找出擦除次数最小的blk，然后更新存储池，让zone映射指向包含的blk
+        zone->erase_count = 0;
         for (int ch= 0; ch < ssd->num_ch; ch++)
         {
             for (int lun = 0; lun < ssd->num_lun; lun++)
@@ -1573,16 +1582,25 @@ static void zns_zone_blks_remaping(FemuCtrl *n, NvmeZone *zone)
                         if (min_erase_blk != NULL && ssd->ch[ch].fc[lun].blk[n].erase_count < min_erase_blk->erase_count)
                         {
                             min_erase_blk = &(ssd->ch[ch].fc[lun].blk[n]);
-                            break;
+                            // femu_debug("select ch:%u lun:%u blk_id:%lu ec:%lu -> zone:%u\n\r",ch,lun,min_erase_blk->blk_id,min_erase_blk->erase_count,zone_id);
+                        }else if (min_erase_blk == NULL)
+                        {
+                            min_erase_blk = &(ssd->ch[ch].fc[lun].blk[n]);
                         }
-                        min_erase_blk = &(ssd->ch[ch].fc[lun].blk[n]);
                     }
                 }
+                femu_debug("select ch:%u lun:%u blk_id:%lu ec:%lu -> zone:%u\n\r",ch,lun,min_erase_blk->blk_id,min_erase_blk->erase_count,zone_id);
                 zone->blks[lun + ch*ssd->num_lun] = min_erase_blk;
+                ssd->zns_blk_pool.blks_pool[min_erase_blk->blk_id] = 1;
+                zone->erase_count += min_erase_blk->erase_count;
+                min_erase_blk = NULL;
+                femu_debug("zone:%u erase_count:%lu\n\r",zone_id,zone->erase_count);
             }
-        }      
+        }    
+        femu_debug("zone:%u remap successfully,erase_count:%lu\n\r",zone_id,zone->erase_count);  
     }else
     {
+        femu_debug("zone:%u remap failed: can not satisfied remap case\n\r",zone_id);  
         return;
     }
 }
@@ -1601,7 +1619,7 @@ static void zns_init_params(FemuCtrl *n)
     id_zns->zns_blk_pool = *(struct zns_blk_pool *)g_malloc0(sizeof(struct zns_blk_pool));
     id_zns->zns_blk_pool.min_erase_count = 0;
     id_zns->zns_blk_pool.blks_pool = g_malloc0(sizeof(uint32_t) * BLKS_PER_CH * id_zns->num_ch);
-    memset(id_zns->zns_blk_pool.blks_pool, 1, sizeof(uint32_t) * BLKS_PER_CH * id_zns->num_ch);
+    memset(id_zns->zns_blk_pool.blks_pool, 0, sizeof(uint32_t) * BLKS_PER_CH * id_zns->num_ch);
     
     for (i =0; i < id_zns->num_ch; i++) {
         zns_init_ch(&id_zns->ch[i], id_zns->num_lun,i);
