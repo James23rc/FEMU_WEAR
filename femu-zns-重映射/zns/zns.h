@@ -46,14 +46,14 @@ struct nand_cmd {
 };
 
 struct zns_blk_pool {
-    uint32_t *blks_pool;//块池数组，下标为物理blk的id，数组内存该块是否可以被选择 1表示占用不可选择，0相反
-    uint64_t min_erase_count;//记录zone间的最小擦除次数
+    uint8_t *blks_pool;//块池数组，下标为物理blk的id，数组内存该块是否可以被选择 1表示占用不可选择，0相反
+    uint64_t zone_min_erase_count;//记录zone间的最小擦除次数
 };
 
 struct zns_blk {
     uint64_t next_blk_avail_time;
     /*Added ch/lun for global erase statistics 8-21*/
-    uint64_t blk_id;// use blk_id can work out ch/lun
+    uint64_t blk_id;// physical blk_id
     uint64_t erase_count;
 };
 
@@ -75,7 +75,7 @@ struct zns_ssd {
     uint64_t blks_per_ch;
     struct zns_ch *ch;
     struct write_pointer wp;
-    struct zns_blk_pool zns_blk_pool;
+    struct zns_blk_pool zns_blk_pool;//blk资源池
 };
 
 enum NvmeZoneAttr {

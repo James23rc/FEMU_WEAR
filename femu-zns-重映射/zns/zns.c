@@ -8,7 +8,8 @@
 #define BLKS_PER_LUN 32*8
 #define BLKS_PER_CH 32*8*4
 #define BLKS_PER_ZONE 32
-#define ERASE_THRESHOLD 32 * 5
+#define ERASE_THRESHOLD 32
+#define REMAP_BETWEEN_ZONES 96
 static void zns_zone_blks_remaping(FemuCtrl *n, NvmeZone *zone,uint32_t zone_id);
 
 static inline uint32_t zns_zone_idx(NvmeNamespace *ns, uint64_t slba)
@@ -440,7 +441,6 @@ static uint16_t zns_auto_open_zone(NvmeNamespace *ns, NvmeZone *zone)
         zns_auto_transition_zone(ns);
         status = zns_aor_check(ns, 0, 1);
     }
-
     return status;
 }
 
@@ -1263,7 +1263,7 @@ static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
 
         backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
     }
-    // femu_debug("zns_do_write called");
+    // femu_debug("zns_do_write called\n\r");
     zns_finalize_zoned_write(ns, req, false);
     return NVME_SUCCESS;
 
@@ -1404,7 +1404,6 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
 
     //convert an LBA to the equivalent in bytes
     data_offset = zns_l2b(ns, slba);
-
     status = zns_map_dptr(n, data_size, req);//用于将NVMe命令的数据传输指针（Data Pointer，DPTR）映射到主机的内存区域,将prp内存地址保存在req->qsg
     if (status) {
         goto err;
@@ -1414,7 +1413,6 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
     //在 ZNS 写操作完成后，更新区域的写指针，处理区域状态的转换，以及根据写操作是否失败来设置结果中的 SLBA
     zns_finalize_zoned_write(ns, req, false);
-
     uint64_t slpn = (slba) / 4096;//逻辑块地址为什么除以4096 -->slba*512/(8*512)才是第一个lpn吧
     uint64_t elpn = (slba + nlb - 1) / 4096;//(slba + nlb - 1) *512/ 4096
 
@@ -1426,7 +1424,6 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     for (lpn = slpn; lpn <= elpn; lpn++) {
         ppa = lpn_to_ppa(n, ns, lpn);
         advance_read_pointer(n);
-
         struct nand_cmd write;
         write.cmd = NAND_WRITE;
         write.stime = req->stime;
@@ -1546,7 +1543,7 @@ static void zns_zone_blks_remaping(FemuCtrl *n, NvmeZone *zone ,uint32_t zone_id
 
     struct zns_blk *min_erase_blk = NULL;//最小擦除次数 blk的物理blk id
 
-    if(zone->erase_count >= ERASE_THRESHOLD || zone->blks[0] == NULL)
+    if(zone->erase_count >= ERASE_THRESHOLD || zone->blks[0] == NULL || (zone->erase_count - ssd->zns_blk_pool.zone_min_erase_count) > REMAP_BETWEEN_ZONES)
     {
         for (int i = 0; i < n->num_zones; i++, zones++) 
         {
@@ -1558,8 +1555,11 @@ static void zns_zone_blks_remaping(FemuCtrl *n, NvmeZone *zone ,uint32_t zone_id
             //首先循环zone映射的blk，释放其blk（让其blk_pool的值设置为0）,然后将映射取消 
             for (int j = 0; j < BLKS_PER_ZONE; j++)
             {
-                ssd->zns_blk_pool.blks_pool[zones->blks[j]->blk_id] = 0;
-                zones->blks[j] = NULL;
+                if (zones->blks[j] != NULL)
+                {
+                    ssd->zns_blk_pool.blks_pool[zones->blks[j]->blk_id] = 0;
+                    zones->blks[j] = NULL;
+                }
             }
             zones->erase_count = 0;
         }
@@ -1589,15 +1589,21 @@ static void zns_zone_blks_remaping(FemuCtrl *n, NvmeZone *zone ,uint32_t zone_id
                         }
                     }
                 }
-                femu_debug("select ch:%u lun:%u blk_id:%lu ec:%lu -> zone:%u\n\r",ch,lun,min_erase_blk->blk_id,min_erase_blk->erase_count,zone_id);
+                // femu_debug("select ch:%u lun:%u blk_id:%lu ec:%lu -> zone:%u\n\r",ch,lun,min_erase_blk->blk_id,min_erase_blk->erase_count,zone_id);
                 zone->blks[lun + ch*ssd->num_lun] = min_erase_blk;
                 ssd->zns_blk_pool.blks_pool[min_erase_blk->blk_id] = 1;
                 zone->erase_count += min_erase_blk->erase_count;
                 min_erase_blk = NULL;
-                femu_debug("zone:%u erase_count:%lu\n\r",zone_id,zone->erase_count);
+                // femu_debug("zone:%u erase_count:%lu\n\r",zone_id,zone->erase_count);
             }
-        }    
+        }
+        //更新zone 中最小的zone的擦除次数    
+        if (zone->erase_count < ssd->zns_blk_pool.zone_min_erase_count)
+        {
+            ssd->zns_blk_pool.zone_min_erase_count = zone->erase_count;
+        }
         femu_debug("zone:%u remap successfully,erase_count:%lu\n\r",zone_id,zone->erase_count);  
+        return;
     }else
     {
         femu_debug("zone:%u remap failed: can not satisfied remap case\n\r",zone_id);  
@@ -1617,9 +1623,9 @@ static void zns_init_params(FemuCtrl *n)
     id_zns->ch = g_malloc0(sizeof(struct zns_ch) * id_zns->num_ch);
     //addition
     id_zns->zns_blk_pool = *(struct zns_blk_pool *)g_malloc0(sizeof(struct zns_blk_pool));
-    id_zns->zns_blk_pool.min_erase_count = 0;
-    id_zns->zns_blk_pool.blks_pool = g_malloc0(sizeof(uint32_t) * BLKS_PER_CH * id_zns->num_ch);
-    memset(id_zns->zns_blk_pool.blks_pool, 0, sizeof(uint32_t) * BLKS_PER_CH * id_zns->num_ch);
+    id_zns->zns_blk_pool.zone_min_erase_count = 0;
+    id_zns->zns_blk_pool.blks_pool = g_malloc0(sizeof(uint8_t) * BLKS_PER_CH * id_zns->num_ch);
+    memset(id_zns->zns_blk_pool.blks_pool, 0, sizeof(uint8_t) * BLKS_PER_CH * id_zns->num_ch);
     
     for (i =0; i < id_zns->num_ch; i++) {
         zns_init_ch(&id_zns->ch[i], id_zns->num_lun,i);
